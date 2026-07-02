@@ -99,6 +99,15 @@
   `;
   document.head.appendChild(style);
 
+  // Swift-HUD parity: the whole background drags, not just the top bar.
+  // The attribute only fires on the element clicked itself, so buttons,
+  // cards, and text stay clickable.
+  document.body.setAttribute("data-tauri-drag-region", "");
+  const appMain = document.getElementById("app");
+  if (appMain) {
+    appMain.setAttribute("data-tauri-drag-region", "");
+  }
+
   if (topbar) {
     topbar.setAttribute("data-tauri-drag-region", "");
 
