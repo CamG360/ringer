@@ -888,6 +888,112 @@ def atomic_write_text(path: Path, text: str) -> None:
                 tmp_path.unlink()
 
 
+def ringer_home() -> Path:
+    value = os.environ.get(f"{ENV_VAR_PREFIX}_HOME")
+    if value and value.strip():
+        return Path(value).expanduser().resolve()
+    return (Path.home() / STATE_DIR_NAME).resolve()
+
+
+def active_runs_path() -> Path:
+    return ringer_home() / "active-runs.json"
+
+
+def pid_is_alive(pid: int) -> bool:
+    if pid <= 0:
+        return False
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+    except OSError:
+        return False
+    return True
+
+
+def _read_active_runs_raw(path: Path) -> dict[str, dict[str, Any]]:
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except FileNotFoundError:
+        return {}
+    except (OSError, json.JSONDecodeError, UnicodeDecodeError):
+        return {}
+    if not isinstance(data, dict):
+        return {}
+    runs: dict[str, dict[str, Any]] = {}
+    for run_id, value in data.items():
+        if isinstance(run_id, str) and isinstance(value, dict):
+            runs[run_id] = value
+    return runs
+
+
+def _prune_active_runs(runs: dict[str, dict[str, Any]]) -> dict[str, dict[str, Any]]:
+    pruned: dict[str, dict[str, Any]] = {}
+    for run_id, entry in runs.items():
+        pid = entry.get("pid")
+        if isinstance(pid, bool):
+            continue
+        try:
+            pid_int = int(pid)
+        except (TypeError, ValueError):
+            continue
+        if not pid_is_alive(pid_int):
+            continue
+        pruned[run_id] = {
+            "pid": pid_int,
+            "identity": str(entry.get("identity", "")),
+            "run_name": str(entry.get("run_name", "")),
+            "workdir": str(entry.get("workdir", "")),
+            "started_at": str(entry.get("started_at", "")),
+        }
+    return pruned
+
+
+def _write_active_runs(runs: dict[str, dict[str, Any]]) -> None:
+    path = active_runs_path()
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_name(f".{path.name}.{os.getpid()}.tmp")
+    tmp.write_text(json.dumps(_prune_active_runs(runs), indent=2, sort_keys=True), encoding="utf-8")
+    os.replace(tmp, path)
+
+
+def read_active_runs() -> dict[str, dict[str, Any]]:
+    path = active_runs_path()
+    runs = _read_active_runs_raw(path)
+    pruned = _prune_active_runs(runs)
+    if pruned != runs:
+        _write_active_runs(pruned)
+    return pruned
+
+
+def register_active_run(
+    run_id: str,
+    identity: str,
+    run_name: str,
+    workdir: Path,
+    *,
+    pid: int | None = None,
+    started_at: datetime | None = None,
+) -> None:
+    runs = read_active_runs()
+    runs[run_id] = {
+        "pid": int(pid if pid is not None else os.getpid()),
+        "identity": identity,
+        "run_name": run_name,
+        "workdir": str(workdir),
+        "started_at": (started_at or datetime.now(timezone.utc)).isoformat(),
+    }
+    _write_active_runs(runs)
+
+
+def unregister_active_run(run_id: str) -> None:
+    runs = read_active_runs()
+    runs.pop(run_id, None)
+    _write_active_runs(runs)
+
+
 def scan_run_states(state_dir: Path) -> list[dict[str, Any]]:
     """Best-effort scan of every run state file, for the multi-run index artifact."""
     runs_dir = state_dir / "runs"
@@ -2401,6 +2507,188 @@ def create_demo_manifest() -> Path:
     return path
 
 
+def repo_root() -> Path:
+    return Path(__file__).resolve().parent
+
+
+def claude_root(project: bool) -> Path:
+    return (Path.cwd() if project else Path.home()) / ".claude"
+
+
+def ringer_skill_source() -> Path:
+    return repo_root() / ".claude" / "skills" / "ringer" / "SKILL.md"
+
+
+def ringer_hook_command(action: str) -> str:
+    hook_path = repo_root() / "hooks" / "ringer_nudge.py"
+    return f"python3 {shlex.quote(str(hook_path))} {action}"
+
+
+def backup_file(path: Path) -> Path | None:
+    if not path.exists():
+        return None
+    stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S.%fZ")
+    backup = path.with_name(f"{path.name}.bak-{stamp}")
+    shutil.copy2(path, backup)
+    return backup
+
+
+def load_settings(path: Path) -> dict[str, Any]:
+    if not path.exists():
+        return {}
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except json.JSONDecodeError as exc:
+        raise ValueError(f"settings file is not valid JSON: {path}") from exc
+    if not isinstance(data, dict):
+        raise ValueError(f"settings file must contain a JSON object: {path}")
+    return data
+
+
+def write_settings(path: Path, settings: dict[str, Any]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    backup_file(path)
+    tmp = path.with_name(f".{path.name}.{os.getpid()}.tmp")
+    tmp.write_text(json.dumps(settings, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+    os.replace(tmp, path)
+
+
+def hook_command_contains(value: Any, needle: str = "ringer_nudge.py") -> bool:
+    return isinstance(value, dict) and needle in str(value.get("command", ""))
+
+
+def event_has_ringer_hook(groups: Any) -> bool:
+    if not isinstance(groups, list):
+        return False
+    for group in groups:
+        if not isinstance(group, dict):
+            continue
+        handlers = group.get("hooks")
+        if isinstance(handlers, list) and any(hook_command_contains(handler) for handler in handlers):
+            return True
+    return False
+
+
+def merge_ringer_hook(settings: dict[str, Any], event: str, matcher: str, command: str) -> bool:
+    hooks = settings.setdefault("hooks", {})
+    if not isinstance(hooks, dict):
+        raise ValueError("settings hooks field must be a JSON object")
+    groups = hooks.setdefault(event, [])
+    if not isinstance(groups, list):
+        raise ValueError(f"settings hooks.{event} field must be a JSON array")
+    if event_has_ringer_hook(groups):
+        return False
+    groups.append(
+        {
+            "matcher": matcher,
+            "hooks": [
+                {
+                    "type": "command",
+                    "command": command,
+                }
+            ],
+        }
+    )
+    return True
+
+
+def remove_ringer_hooks(settings: dict[str, Any]) -> int:
+    hooks = settings.get("hooks")
+    if not isinstance(hooks, dict):
+        return 0
+    removed = 0
+    for event in list(hooks):
+        groups = hooks[event]
+        if not isinstance(groups, list):
+            continue
+        kept_groups = []
+        for group in groups:
+            if not isinstance(group, dict):
+                kept_groups.append(group)
+                continue
+            handlers = group.get("hooks")
+            if not isinstance(handlers, list):
+                kept_groups.append(group)
+                continue
+            kept_handlers = []
+            for handler in handlers:
+                if hook_command_contains(handler):
+                    removed += 1
+                else:
+                    kept_handlers.append(handler)
+            if kept_handlers:
+                new_group = dict(group)
+                new_group["hooks"] = kept_handlers
+                kept_groups.append(new_group)
+        if kept_groups:
+            hooks[event] = kept_groups
+        else:
+            del hooks[event]
+    if not hooks:
+        del settings["hooks"]
+    return removed
+
+
+def install_agent(project: bool = False) -> int:
+    root = claude_root(project)
+    skill_source = ringer_skill_source()
+    skill_target = root / "skills" / "ringer" / "SKILL.md"
+    if not skill_source.exists():
+        raise ValueError(f"ringer skill source not found: {skill_source}")
+    skill_target.parent.mkdir(parents=True, exist_ok=True)
+    shutil.copy2(skill_source, skill_target)
+
+    settings_path = root / "settings.json"
+    settings = load_settings(settings_path)
+    changed = False
+    changed |= merge_ringer_hook(
+        settings,
+        "PreToolUse",
+        "Bash",
+        ringer_hook_command("pre-bash"),
+    )
+    changed |= merge_ringer_hook(
+        settings,
+        "PostToolUse",
+        "Edit|Write",
+        ringer_hook_command("post-edit"),
+    )
+    if changed or not settings_path.exists():
+        write_settings(settings_path, settings)
+
+    scope = "project" if project else "user"
+    print(f"Installed ringer agent for {scope} scope.")
+    print(f"Skill: {skill_target}")
+    if changed:
+        print(f"Hooks: added PreToolUse Bash and PostToolUse Edit|Write in {settings_path}")
+    else:
+        print(f"Hooks: already present in {settings_path}")
+    return 0
+
+
+def uninstall_agent(project: bool = False) -> int:
+    root = claude_root(project)
+    settings_path = root / "settings.json"
+    removed_hooks = 0
+    if settings_path.exists():
+        settings = load_settings(settings_path)
+        removed_hooks = remove_ringer_hooks(settings)
+        if removed_hooks:
+            write_settings(settings_path, settings)
+
+    skill_dir = root / "skills" / "ringer"
+    removed_skill = False
+    if skill_dir.exists():
+        shutil.rmtree(skill_dir)
+        removed_skill = True
+
+    scope = "project" if project else "user"
+    print(f"Uninstalled ringer agent for {scope} scope.")
+    print(f"Hooks removed: {removed_hooks}")
+    print(f"Skill removed: {'yes' if removed_skill else 'no'}")
+    return 0
+
+
 async def run_manifest(
     manifest: Manifest,
     config: AppConfig,
@@ -2415,7 +2703,18 @@ async def run_manifest(
         dashboard_enabled=dashboard_enabled,
         force_browser=force_browser,
     )
-    return await runner.run()
+    register_active_run(
+        runner.run_id,
+        identity,
+        manifest.run_name,
+        manifest.workdir,
+        started_at=runner.started_at,
+    )
+    try:
+        return await runner.run()
+    finally:
+        unregister_active_run(runner.run_id)
+
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -2459,6 +2758,12 @@ def build_parser() -> argparse.ArgumentParser:
         help="disable zero-LLM HTML status/report artifacts (see [artifact] in config.toml)",
     )
     demo_parser.add_argument("--dry-run", action="store_true", help="print the demo plan without spawning codex")
+
+    install_parser = subparsers.add_parser("install-agent", help="install the ringer Claude Code skill and hooks")
+    install_parser.add_argument("--project", action="store_true", help="install into ./.claude instead of ~/.claude")
+
+    uninstall_parser = subparsers.add_parser("uninstall-agent", help="remove the ringer Claude Code skill and hooks")
+    uninstall_parser.add_argument("--project", action="store_true", help="remove from ./.claude instead of ~/.claude")
     return parser
 
 
@@ -2469,6 +2774,11 @@ def main(argv: list[str] | None = None) -> int:
     parser = build_parser()
     args = parser.parse_args(argv)
     try:
+        if args.command == "install-agent":
+            return install_agent(project=args.project)
+        if args.command == "uninstall-agent":
+            return uninstall_agent(project=args.project)
+
         if args.command == "lint":
             manifest = Manifest.from_path(args.manifest)
             findings = lint_manifest(manifest)
