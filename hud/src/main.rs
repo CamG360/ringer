@@ -126,10 +126,9 @@ fn resize_main_window<R: Runtime>(
     Ok(())
 }
 
-/// Feature 2 (embedded live artifact): read a Tier 0 HTML artifact ringer.py rendered to disk,
-/// so the frontend can embed it via `<iframe srcdoc>` without relaxing the webview CSP or
-/// touching the Tauri `asset:` protocol scope. Restricted to canonical paths under
-/// `<state_dir>/artifacts`.
+/// Read a Tier 0 HTML artifact ringer.py rendered to disk for callers that need raw HTML.
+/// The Ringside artifact view loads artifact files through Tauri's asset protocol instead.
+/// Restricted to canonical paths under `<state_dir>/artifacts`.
 #[tauri::command]
 fn read_artifact_html(path: String) -> Result<String, String> {
     let state_dir = load_state_dir();

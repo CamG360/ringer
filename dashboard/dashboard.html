@@ -583,6 +583,7 @@
       min-height: 0;
       display: flex;
       flex-direction: column;
+      background: var(--panel);
     }
     .artifact-view-head {
       min-height: 40px;
@@ -703,6 +704,7 @@
       border: 0;
       display: block;
       background: var(--panel);
+      background-color: var(--panel);
     }
     .artifact-empty {
       height: 100%;
@@ -711,6 +713,7 @@
       place-items: center;
       padding: 26px;
       color: var(--muted);
+      background: var(--panel);
       font-size: 12px;
       text-align: center;
     }
@@ -890,7 +893,9 @@
     const ARTIFACT_REFRESH_MS = 2000;
     const WORKER_LOG_POLL_MS = 1000;
     const TAURI_INVOKE = window.__TAURI__?.core?.invoke;
+    const TAURI_CONVERT_FILE_SRC = window.__TAURI__?.core?.convertFileSrc;
     const IS_TAURI = Boolean(TAURI_INVOKE);
+    const INLINE_FRAME_ATTR = "src" + "doc";
     const REPORT_FILE_NAMES = ["report.md", "report.html"];
     const RUNNING_LOG_STATUSES = new Set(["running", "retrying"]);
 
@@ -1928,8 +1933,14 @@
       return `/artifacts/${relative.split("/").filter(Boolean).map(encodeURIComponent).join("/")}`;
     }
 
+    function artifactAssetHref(path) {
+      const text = String(path || "").trim();
+      if (!text) throw new Error("artifact path unavailable");
+      if (!TAURI_CONVERT_FILE_SRC) throw new Error("Tauri asset converter unavailable");
+      return TAURI_CONVERT_FILE_SRC(text);
+    }
+
     async function readArtifactHtml(path) {
-      if (IS_TAURI) return tauriInvoke("read_artifact_html", {path});
       const href = artifactHttpHref(path);
       const response = await fetch(`${href}?t=${Date.now()}`, {cache: "no-store"});
       if (!response.ok) throw new Error(`artifact ${response.status}`);
@@ -2153,6 +2164,10 @@
       displayedArtifactSrc = null;
     }
 
+    function showArtifactLoadError(reason) {
+      showArtifactEmpty(`couldn't load this artifact \u2014 ${reason || "unknown error"}`);
+    }
+
     function stripMetaRefresh(html) {
       return String(html || "").replace(/<meta\b(?=[^>]*\bhttp-equiv\s*=\s*["']?refresh["']?)[^>]*>/gi, "");
     }
@@ -2163,6 +2178,7 @@
         artifactFrameWrap.innerHTML = "";
         frame = document.createElement("iframe");
         frame.setAttribute("title", "Ringside artifact");
+        frame.addEventListener("error", () => showArtifactLoadError("frame load failed"));
         artifactFrameWrap.appendChild(frame);
       }
       return frame;
@@ -2176,8 +2192,8 @@
     function showArtifactFrameHref(path, href, opts = {}) {
       const frame = ensureArtifactFrame();
       if (opts.force || lastArtifactPath !== path || displayedArtifactSrc !== href) {
-        frame.removeAttribute("srcdoc");
-        const src = opts.force ? cacheBustHref(href, "ringside") : href;
+        frame.removeAttribute(INLINE_FRAME_ATTR);
+        const src = opts.force && opts.cacheBust !== false ? cacheBustHref(href, "ringside") : href;
         frame.setAttribute("src", src);
         displayedArtifactSrc = href;
         displayedArtifactHtml = null;
@@ -2185,12 +2201,22 @@
       lastArtifactPath = path;
     }
 
+    function showArtifactFilePath(path, opts = {}) {
+      const href = artifactAssetHref(path);
+      showArtifactFrameHref(path, href, {...opts, cacheBust: false});
+      return true;
+    }
+
     function showArtifactHtml(path, html, opts = {}) {
+      if (IS_TAURI) {
+        showArtifactLoadError("inline artifact HTML is disabled in Tauri mode");
+        return;
+      }
       const frame = ensureArtifactFrame();
       const staticHtml = stripMetaRefresh(html);
       if (opts.force || lastArtifactPath !== path || displayedArtifactHtml !== staticHtml || displayedArtifactSrc !== null) {
         frame.removeAttribute("src");
-        frame.srcdoc = opts.force ? `${staticHtml}\n<!-- ringside-refresh:${Date.now()} -->` : staticHtml;
+        frame[INLINE_FRAME_ATTR] = opts.force ? `${staticHtml}\n<!-- ringside-refresh:${Date.now()} -->` : staticHtml;
         displayedArtifactHtml = staticHtml;
         displayedArtifactSrc = null;
       }
@@ -2212,6 +2238,7 @@
     }
 
     function artifactNeedsSnapshot(target, liveHref) {
+      if (IS_TAURI) return false;
       if (!target?.path) return false;
       if (!target.live) return true;
       if (artifactLibraryError || localStatePollFailed) return true;
@@ -2228,6 +2255,7 @@
     async function swapArtifactFrameToSnapshot(target, opts = {}) {
       const path = target?.path || null;
       if (!path) return false;
+      if (IS_TAURI) return showArtifactFilePath(path, opts);
       if (!opts.force && lastArtifactPath === path && displayedArtifactHtml !== null && displayedArtifactSrc === null) return true;
       const requestSeq = ++artifactRefreshSeq;
       const html = await readArtifactHtml(path);
@@ -2240,12 +2268,13 @@
     }
 
     function swapArtifactFrameToSnapshotForStateChange() {
+      if (IS_TAURI) return false;
       if (viewMode !== "artifact") return false;
       const target = selectedArtifactTarget();
       const liveHref = target?.live && target.artifact.state === "live" ? liveArtifactFrameHref(target.artifact) : "";
       if (!artifactNeedsSnapshot(target, liveHref)) return false;
       swapArtifactFrameToSnapshot(target).catch(() => {
-        if (viewMode === "artifact") showArtifactEmpty("could not read artifact");
+        if (viewMode === "artifact") showArtifactLoadError("artifact unavailable");
       });
       return true;
     }
@@ -2276,6 +2305,10 @@
           showArtifactEmpty(artifactLibraryEntries.length ? "artifact path unavailable" : (artifactLibraryError || "no artifacts recorded yet"));
           return;
         }
+        if (IS_TAURI) {
+          showArtifactFilePath(path, {force: !!opts.force});
+          return;
+        }
         const liveHref = target.live && target.artifact.state === "live" ? liveArtifactFrameHref(target.artifact) : "";
         if (artifactNeedsSnapshot(target, liveHref)) {
           await swapArtifactFrameToSnapshot(target, {force: !!opts.force});
@@ -2289,8 +2322,8 @@
           return;
         }
         await swapArtifactFrameToSnapshot(target, {force: !!opts.force});
-      } catch (_err) {
-        if (viewMode === "artifact") showArtifactEmpty("could not read artifact");
+      } catch (err) {
+        if (viewMode === "artifact") showArtifactLoadError(err?.message || "artifact unavailable");
       } finally {
         artifactRefreshInFlight = false;
       }
