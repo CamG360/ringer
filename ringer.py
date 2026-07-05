@@ -48,6 +48,7 @@ ACTIVITY_TAIL_BYTES = 2048
 ACTIVITY_TEXT_LIMIT = 80
 ARTIFACT_WRAPPER_TAIL_BYTES = 256 * 1024
 ARTIFACT_LIBRARY_MAX_VERSIONS = 20
+WORKER_LOG_TAIL_BYTES = 64 * 1024
 TASK_REPORT_FILENAMES = ("report.md", "report.html")
 SHEPHERD_MODEL = f"none ({TOOL_NAME}.py)"
 VERIFY_METHOD = "executed-check"
@@ -916,6 +917,7 @@ class StateWriter:
                 "state": "finished" if self.finished else "live",
                 "pid": self.pid,
                 "port": self.port,
+                "dashboard_port": self.port,
                 "max_parallel": self.max_parallel,
                 "finished": self.finished,
                 "summary": self.summary if self.finished else None,
@@ -2390,6 +2392,23 @@ def resolve_artifact_http_path(artifact_root: Path, request_path: str) -> Path |
     return candidate
 
 
+def task_log_path_from_state(state_path: Path, task_key: str) -> Path | None:
+    try:
+        data = json.loads(state_path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return None
+    tasks = data.get("tasks")
+    if not isinstance(tasks, list):
+        return None
+    for task in tasks:
+        if not isinstance(task, dict) or task.get("key") != task_key:
+            continue
+        log_path = task.get("log_path")
+        if isinstance(log_path, str) and log_path:
+            return Path(log_path)
+    return None
+
+
 class Dashboard:
     def __init__(
         self,
@@ -2427,9 +2446,23 @@ class Dashboard:
                     try:
                         body = state_path.read_bytes()
                     except FileNotFoundError:
-                        body = b'{"run_name":"ringer","identity":"unknown","started_at":"","tasks":[],"totals":{"running":0,"done":0,"pass":0,"fail":0,"tokens":0}}'
+                        body = b'{"run_name":"ringer","identity":"unknown","started_at":"","port":null,"dashboard_port":null,"tasks":[],"totals":{"running":0,"done":0,"pass":0,"fail":0,"tokens":0}}'
                     self.send_response(HTTPStatus.OK)
                     self.send_header("Content-Type", "application/json; charset=utf-8")
+                    self.send_header("Cache-Control", "no-store")
+                    self.send_header("Content-Length", str(len(body)))
+                    self.end_headers()
+                    self.wfile.write(body)
+                    return
+                if path.startswith("/logs/"):
+                    task_key = urllib.parse.unquote(path[len("/logs/") :])
+                    log_path = task_log_path_from_state(state_path, task_key)
+                    if log_path is None:
+                        self.send_error(HTTPStatus.NOT_FOUND)
+                        return
+                    body = tail_file_text(log_path, max_bytes=WORKER_LOG_TAIL_BYTES).encode("utf-8")
+                    self.send_response(HTTPStatus.OK)
+                    self.send_header("Content-Type", "text/plain; charset=utf-8")
                     self.send_header("Cache-Control", "no-store")
                     self.send_header("Content-Length", str(len(body)))
                     self.end_headers()
@@ -3218,6 +3251,20 @@ def tail_lines(path: Path, line_count: int) -> list[str]:
         return []
     text = data.decode("utf-8", errors="replace")
     return text.splitlines()[-line_count:]
+
+
+def tail_file_text(path: Path, max_bytes: int) -> str:
+    if max_bytes <= 0 or not path.exists():
+        return ""
+    try:
+        with path.open("rb") as fh:
+            fh.seek(0, os.SEEK_END)
+            size = fh.tell()
+            fh.seek(max(0, size - max_bytes))
+            data = fh.read()
+    except OSError:
+        return ""
+    return data.decode("utf-8", errors="replace")
 
 
 def tail_text(path: Path, max_bytes: int = 6000, line_count: int = 40) -> str:
