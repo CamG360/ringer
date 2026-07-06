@@ -835,7 +835,9 @@
       try {
         const response = await fetch(path, {cache: "no-store"});
         if (!response.ok) throw new Error(`HTTP ${response.status}`);
-        const text = await response.text();
+        const raw = await response.text();
+        // Worker logs carry raw terminal output; strip ANSI escapes for the stream view.
+        const text = raw.replace(/\[[0-9;?]*[ -\/]*[@-~]/g, "").replace(/\[[0-9;]{1,6}m/g, "");
         if (state.expanded !== expanded) return;
         expanded.logText = text || "No log output yet.";
         expanded.error = "";
