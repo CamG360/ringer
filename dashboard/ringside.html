@@ -1144,7 +1144,12 @@
         // The live page carries a meta refresh for standalone viewing; inside
         // this pane WE are the refresher — strip it and swap content only on
         // change, so nothing ever flashes.
-        const html = raw.replace(/<meta[^>]+http-equiv=["']?refresh["']?[^>]*>/gi, "");
+        let html = raw.replace(/<meta[^>]+http-equiv=["']?refresh["']?[^>]*>/gi, "");
+        // srcdoc documents have no base URL: without this, every relative
+        // deliverable/work-log link 404s. Resolve against the fetched URL and
+        // open results in a new tab so the pane never navigates away.
+        const baseHref = new URL(target.src, window.location.href).href;
+        html = html.replace(/<head([^>]*)>/i, `<head$1><base href="${baseHref}" target="_blank">`);
         if (state.frameKey === target.key && state.frameContent === html) return;
         let frame = els.frameWrap.querySelector("iframe");
         const sameDoc = frame && state.frameKey === target.key;
