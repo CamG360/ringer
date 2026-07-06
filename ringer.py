@@ -65,7 +65,7 @@ IMAGE_DELIVERABLE_SUFFIXES = {".avif", ".gif", ".jpeg", ".jpg", ".png", ".svg", 
 FALLBACK_HARVEST_SUFFIXES = (
     (TEXT_DELIVERABLE_SUFFIXES - {".log"})
     | IMAGE_DELIVERABLE_SUFFIXES
-    | {".html", ".htm", ".json", ".csv", ".pdf"}
+    | {".html", ".htm", ".json", ".csv", ".pdf", ".mp4", ".webm", ".mov", ".gif"}
 )
 FALLBACK_HARVEST_MAX_FILES = 8
 SHEPHERD_MODEL = f"none ({TOOL_NAME}.py)"
