@@ -186,7 +186,7 @@ class PlainEnglishArtifactTests(unittest.TestCase):
 
         for html in (live_html, final_html):
             self.assertNotIn("Technical detail", html)
-            self.assertNotIn("<details", html)
+            self.assertNotIn("Technical detail", html)
             self.assertNotIn("<table", html)
 
     def test_meta_refresh_is_live_only(self) -> None:

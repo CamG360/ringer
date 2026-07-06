@@ -1746,6 +1746,21 @@ ARTIFACT_BASE_CSS = """
   .timeline {
     margin-bottom: clamp(28px, 5vw, 44px);
   }
+  details.timeline > summary {
+    cursor: pointer;
+    list-style: none;
+  }
+  details.timeline > summary::-webkit-details-marker { display: none; }
+  details.timeline > summary h2::after {
+    content: " ▸";
+    color: var(--muted);
+    font-size: 11px;
+  }
+  details.timeline[open] > summary h2::after { content: " ▾"; }
+  details.timeline > summary:focus-visible {
+    outline: 2px solid var(--accent);
+    outline-offset: 2px;
+  }
   .tl-row {
     display: grid;
     grid-template-columns: 76px minmax(0,1fr);
@@ -2742,10 +2757,10 @@ def render_final_report_html(
   {render_corner_header(state, live=False)}
   <h1 id="what-happened-heading" class="briefing">What happened — {briefing}</h1>
   {render_work_section(state, renderer=renderer, page_path=page_path, force_wrappers=force_wrappers, primary=True)}
-  <section class="timeline" aria-labelledby="status-updates-heading">
-    <h2 id="status-updates-heading">What's happening</h2>
+  <details class="timeline">
+    <summary><h2 id="status-updates-heading">What happened along the way</h2></summary>
     {render_status_updates(updates, omitted=omitted)}
-  </section>
+  </details>
   {render_task_strip(tasks, state=state, renderer=renderer, force_wrappers=force_wrappers, page_path=page_path)}
   <footer>
     <span class="mono">Finished {html_escape(local_time_label())}</span>
@@ -3181,6 +3196,31 @@ class PersistentHudServer:
                             "active": read_active_runs_file(),
                         },
                     )
+                    return
+                if path.startswith("/api/open-folder"):
+                    query = urllib.parse.urlparse(path).query
+                    params = urllib.parse.parse_qs(query)
+                    name = (params.get("artifact") or [""])[0]
+                    run_id = (params.get("run") or [""])[0]
+                    artifact_root_dir = (state_dir / "artifacts").resolve()
+                    target = artifact_root_dir / "deliverables"
+                    if run_id:
+                        target = target / sanitize_artifact_name(run_id)
+                    if not target.exists():
+                        target = artifact_root_dir
+                    try:
+                        resolved = target.resolve()
+                        if resolved != artifact_root_dir and artifact_root_dir not in resolved.parents:
+                            self.send_error(HTTPStatus.NOT_FOUND)
+                            return
+                        if sys.platform == "darwin":
+                            subprocess.Popen(["open", str(resolved)], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+                            self.send_response(HTTPStatus.NO_CONTENT)
+                            self.end_headers()
+                        else:
+                            self.send_error(HTTPStatus.NOT_IMPLEMENTED)
+                    except Exception:
+                        self.send_error(HTTPStatus.INTERNAL_SERVER_ERROR)
                     return
                 if path == "/api/library":
                     # A run that died without cleanup must not sit "live"

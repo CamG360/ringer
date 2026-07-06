@@ -130,6 +130,17 @@
     @media (prefers-reduced-motion: no-preference) {
       .machine-strip button.live { animation: pulse 1.4s ease-in-out infinite; }
     }
+    .artifact-tools button {
+      padding: 7px 14px;
+      border: 1px solid var(--hairline);
+      border-radius: 7px;
+      background: var(--surface);
+      color: var(--ink);
+      font-size: 13px;
+      cursor: pointer;
+    }
+    .artifact-tools button:hover { border-color: var(--accent); }
+    .artifact-tools button:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
     select,
     .artifact-tools select {
       appearance: none;
@@ -387,7 +398,7 @@
     }
     .artifact-tools {
       display: grid;
-      grid-template-columns: minmax(220px, max-content) minmax(0, 1fr) minmax(180px, max-content);
+      grid-template-columns: minmax(220px, max-content) minmax(0, 1fr) minmax(180px, max-content) max-content;
       gap: 12px;
       align-items: center;
       padding: 10px clamp(12px, 2vw, 18px);
@@ -494,6 +505,7 @@
               <select id="artifact-picker" class="mono" aria-label="Artifact"></select>
               <div id="artifact-status" class="artifact-status">No artifact selected.</div>
               <select id="artifact-version" class="mono" aria-label="Artifact version"></select>
+              <button id="open-folder" type="button" title="Open this run's files in Finder">Open folder</button>
             </div>
             <div id="frame-wrap" class="frame-wrap">
               <div class="artifact-error">No artifacts yet.</div>
@@ -1288,6 +1300,16 @@
       renderArtifactControls();
       loadArtifactFrame(true);
     });
+    document.getElementById("open-folder").addEventListener("click", () => {
+      const artifact = selectedArtifact();
+      if (!artifact) return;
+      const version = state.artifactVersion !== "live"
+        ? artifact.versions.find(item => item.key === state.artifactVersion)
+        : null;
+      const runId = version ? version.run_id : (artifact.current_run_id || "");
+      fetch(`/api/open-folder?artifact=${encodeURIComponent(artifact.name)}&run=${encodeURIComponent(runId)}`).catch(() => {});
+    });
+
     els.artifactPicker.addEventListener("change", () => {
       const name = els.artifactPicker.value;
       if (!name) return;
