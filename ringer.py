@@ -2479,6 +2479,11 @@ def render_work_section(
     primary: bool = False,
 ) -> str:
     items = collect_state_deliverables(state)
+    name_counts: dict[str, int] = {}
+    for entry in items:
+        name_counts[entry["name"]] = name_counts.get(entry["name"], 0) + 1
+    for entry in items:
+        entry["shared_name"] = name_counts.get(entry["name"], 0) > 1
     section_class = "work is-primary" if primary else "work"
     if not items:
         body = '<p class="empty-note">Nothing delivered yet — the workers are still on it.</p>'
@@ -2512,6 +2517,13 @@ def render_work_item(
     name = str(item.get("name", "")).strip() or "work"
     source_path = Path(str(item.get("path", "")))
     label, kind = work_label_and_kind(name)
+    # When several tasks deliver a file with the same name (four personas each
+    # writing reaction.md), the filename stops identifying anything — lead
+    # with the task's name instead.
+    if item.get("shared_name"):
+        pretty_task = task_key.replace("-", " ").replace("_", " ").strip()
+        pretty_task = pretty_task[:1].upper() + pretty_task[1:]
+        label = f"{pretty_task} — {Path(name).stem.replace('-', ' ').replace('_', ' ')}"
     href = work_item_href(
         source_path,
         state=state,
