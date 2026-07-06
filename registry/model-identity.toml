@@ -23,12 +23,16 @@ access = "OAuth plan"
 default_model_key = "grok-build"
 
 [engines.grok.models."grok-build"]
-display = "Grok Build"
+# "Grok Build" is the HARNESS (the CLI product); the model behind the
+# grok-build alias is unnamed by xAI in our data — capability research task
+# caps-grok is establishing the true lineage with citations. Until then the
+# display shows the alias explicitly rather than harness branding.
+display = "Grok (grok-build alias)"
 confidence = "unverified"
 source = ""
 
 [engines.grok.models."grok-composer-2.5-fast"]
-display = "Grok Composer 2.5 Fast"
+display = "Composer 2.5 Fast"
 confidence = "unverified"
 source = ""
 
