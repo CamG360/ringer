@@ -3323,9 +3323,11 @@ class Dashboard:
         # per-run page directly; the parked Tauri app is never auto-launched.
         if self.open_viewer and self.force_browser:
             open_in_browser(url)
-        # flush: under a pipe this line is block-buffered and only appears at
-        # process exit, making live runs look dashboard-less (MBP field report).
-        print(f"Dashboard: {url}", flush=True)
+        # The persistent hud (:8700) is the one watch surface; this per-run
+        # server is an internal state/log feed. Only advertise it when the
+        # user explicitly chose the per-run page with --browser.
+        if self.force_browser:
+            print(f"Dashboard: {url}", flush=True)
         return self.port
 
     def stop(self) -> None:
