@@ -4918,15 +4918,40 @@ def connect_read_model_db(path: Path) -> Any:
     return conn
 
 
+def connect_read_model_db_readonly(path: Path) -> Any:
+    sqlite = ensure_sqlite_available()
+    path = path.expanduser().resolve()
+    if not path.exists():
+        raise RuntimeError(f"read model database missing: {path}")
+    uri_path = urllib.parse.quote(path.as_posix(), safe="/")
+    conn = sqlite.connect(f"file:{uri_path}?mode=ro", uri=True)
+    conn.row_factory = sqlite.Row
+    conn.execute("PRAGMA busy_timeout=5000")
+    return conn
+
+
+def read_model_table_exists(conn: Any, name: str) -> bool:
+    row = conn.execute(
+        "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ?",
+        (name,),
+    ).fetchone()
+    return row is not None
+
+
 def create_read_model_schema(conn: Any) -> None:
+    schema_table_exists = read_model_table_exists(conn, "schema_version")
+    user_version = int(conn.execute("PRAGMA user_version").fetchone()[0] or 0)
+    schema_version = None
+    if schema_table_exists:
+        row = conn.execute("SELECT version FROM schema_version LIMIT 1").fetchone()
+        if row is not None:
+            schema_version = int(row[0])
+    needs_stamp = user_version != 1 or schema_version != 1
     conn.executescript(
         """
         CREATE TABLE IF NOT EXISTS schema_version (
             version INTEGER NOT NULL
         );
-        DELETE FROM schema_version;
-        INSERT INTO schema_version(version) VALUES (1);
-        PRAGMA user_version = 1;
 
         CREATE TABLE IF NOT EXISTS attempts (
             id INTEGER PRIMARY KEY,
@@ -4988,6 +5013,14 @@ def create_read_model_schema(conn: Any) -> None:
         );
         """
     )
+    if needs_stamp:
+        conn.executescript(
+            """
+            DELETE FROM schema_version;
+            INSERT INTO schema_version(version) VALUES (1);
+            PRAGMA user_version = 1;
+            """
+        )
 
 
 def drop_read_model_tables(conn: Any) -> None:
@@ -5011,7 +5044,14 @@ def read_log_rows_from_offset(path: Path, offset: int) -> tuple[list[dict[str, A
     try:
         with path.open("rb") as fh:
             fh.seek(offset)
-            for raw_line in fh:
+            while True:
+                line_start = fh.tell()
+                raw_line = fh.readline()
+                if not raw_line:
+                    break
+                if not raw_line.endswith(b"\n"):
+                    final_offset = line_start
+                    break
                 final_offset = fh.tell()
                 try:
                     line = raw_line.decode("utf-8")
@@ -5026,6 +5066,32 @@ def read_log_rows_from_offset(path: Path, offset: int) -> tuple[list[dict[str, A
     except FileNotFoundError:
         return [], 0, 0
     return rows, skipped, final_offset
+
+
+def read_catalog_events_from_offset(path: Path, offset: int) -> tuple[list[dict[str, Any]], int]:
+    events: list[dict[str, Any]] = []
+    final_offset = offset
+    try:
+        with path.expanduser().open("rb") as fh:
+            fh.seek(offset)
+            while True:
+                line_start = fh.tell()
+                raw_line = fh.readline()
+                if not raw_line:
+                    break
+                if not raw_line.endswith(b"\n"):
+                    final_offset = line_start
+                    break
+                final_offset = fh.tell()
+                try:
+                    event = json.loads(raw_line.decode("utf-8"))
+                except (UnicodeDecodeError, json.JSONDecodeError):
+                    continue
+                if isinstance(event, dict):
+                    events.append(event)
+    except FileNotFoundError:
+        return [], 0
+    return events, final_offset
 
 
 def insert_attempt_rows(conn: Any, rows: list[dict[str, Any]]) -> int:
@@ -5060,47 +5126,41 @@ def insert_attempt_rows(conn: Any, rows: list[dict[str, Any]]) -> int:
     return len(payloads)
 
 
-def refresh_catalog_tables(conn: Any, catalog_path: Path) -> None:
-    conn.execute("DELETE FROM catalog_models")
-    try:
-        catalog_models = load_catalog_snapshot(catalog_path)
-    except (OSError, json.JSONDecodeError, ValueError):
-        catalog_models = []
-    payloads: list[tuple[Any, ...]] = []
-    for model in catalog_models:
-        normalized = normalize_catalog_for_scoreboard(model)
-        model_id = model_log_text(normalized.get("id"))
-        if not model_id:
-            continue
-        payloads.append(
-            (
-                model_id,
-                model_log_text(normalized.get("name")),
-                model_log_int(normalized.get("context_length")),
-                normalized.get("prompt_per_m"),
-                normalized.get("completion_per_m"),
-                1 if normalized.get("free") else 0,
-                1 if normalized.get("variable_pricing") else 0,
-                1 if normalized.get("pricing_unknown") else 0,
-                model_log_text(normalized.get("fetched_at")),
-                model_log_text(normalized.get("modality")),
-            )
-        )
-    if payloads:
-        conn.executemany(
-            """
-            INSERT INTO catalog_models (
-                id, name, context_length, prompt_per_m, completion_per_m, free,
-                variable_pricing, pricing_unknown, fetched_at, modality
-            )
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-            """,
-            payloads,
-        )
+def read_sync_state_value(conn: Any, key: str) -> str | None:
+    row = conn.execute("SELECT value FROM sync_state WHERE key = ?", (key,)).fetchone()
+    if row is None:
+        return None
+    return str(row["value"])
 
-    conn.execute("DELETE FROM catalog_events")
+
+def read_sync_state_int(conn: Any, key: str, default: int = 0) -> int:
+    value = read_sync_state_value(conn, key)
+    if value is None:
+        return default
+    try:
+        return int(value)
+    except ValueError:
+        return default
+
+
+def write_sync_state_values(conn: Any, values: dict[str, int | str]) -> None:
+    conn.executemany(
+        "INSERT OR REPLACE INTO sync_state(key, value) VALUES (?, ?)",
+        [(key, str(value)) for key, value in values.items()],
+    )
+
+
+def file_sync_metadata(path: Path) -> tuple[int, int]:
+    try:
+        stat = path.expanduser().stat()
+    except FileNotFoundError:
+        return -1, 0
+    return int(stat.st_mtime_ns), int(stat.st_size)
+
+
+def insert_catalog_event_rows(conn: Any, events: list[dict[str, Any]]) -> int:
     event_payloads: list[tuple[Any, ...]] = []
-    for event in read_catalog_events(catalog_changes_path(catalog_path), limit=10_000_000):
+    for event in events:
         event_payloads.append(
             (
                 model_log_text(event.get("ts")),
@@ -5113,6 +5173,93 @@ def refresh_catalog_tables(conn: Any, catalog_path: Path) -> None:
         conn.executemany(
             "INSERT INTO catalog_events(ts, kind, model_id, payload) VALUES (?, ?, ?, ?)",
             event_payloads,
+        )
+    return len(event_payloads)
+
+
+def refresh_catalog_tables(conn: Any, catalog_path: Path) -> None:
+    catalog_path = catalog_path.expanduser().resolve()
+    changes_path = catalog_changes_path(catalog_path)
+    catalog_mtime, catalog_size = file_sync_metadata(catalog_path)
+    changes_mtime, changes_size = file_sync_metadata(changes_path)
+    catalog_unchanged = (
+        read_sync_state_int(conn, "catalog_snapshot_mtime_ns", -2) == catalog_mtime
+        and read_sync_state_int(conn, "catalog_snapshot_size", -2) == catalog_size
+    )
+    changes_unchanged = (
+        read_sync_state_int(conn, "catalog_changes_mtime_ns", -2) == changes_mtime
+        and read_sync_state_int(conn, "catalog_changes_size", -2) == changes_size
+    )
+    if catalog_unchanged and changes_unchanged:
+        return
+
+    if not catalog_unchanged:
+        conn.execute("DELETE FROM catalog_models")
+        try:
+            catalog_models = load_catalog_snapshot(catalog_path)
+        except (OSError, json.JSONDecodeError, ValueError):
+            catalog_models = []
+        payloads: list[tuple[Any, ...]] = []
+        for model in catalog_models:
+            normalized = normalize_catalog_for_scoreboard(model)
+            model_id = model_log_text(normalized.get("id"))
+            if not model_id:
+                continue
+            payloads.append(
+                (
+                    model_id,
+                    model_log_text(normalized.get("name")),
+                    model_log_int(normalized.get("context_length")),
+                    normalized.get("prompt_per_m"),
+                    normalized.get("completion_per_m"),
+                    1 if normalized.get("free") else 0,
+                    1 if normalized.get("variable_pricing") else 0,
+                    1 if normalized.get("pricing_unknown") else 0,
+                    model_log_text(normalized.get("fetched_at")),
+                    model_log_text(normalized.get("modality")),
+                )
+            )
+        if payloads:
+            conn.executemany(
+                """
+                INSERT INTO catalog_models (
+                    id, name, context_length, prompt_per_m, completion_per_m, free,
+                    variable_pricing, pricing_unknown, fetched_at, modality
+                )
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                payloads,
+            )
+        write_sync_state_values(
+            conn,
+            {
+                "catalog_snapshot_mtime_ns": catalog_mtime,
+                "catalog_snapshot_size": catalog_size,
+            },
+        )
+
+    if not changes_unchanged:
+        previous_changes_mtime = read_sync_state_value(conn, "catalog_changes_mtime_ns")
+        previous_changes_size = read_sync_state_int(conn, "catalog_changes_size", 0)
+        previous_offset = read_sync_state_int(conn, "catalog_changes_offset", 0)
+        append_only = (
+            previous_changes_mtime is not None
+            and changes_size >= previous_changes_size
+            and previous_offset <= changes_size
+        )
+        if append_only:
+            events, new_offset = read_catalog_events_from_offset(changes_path, previous_offset)
+        else:
+            conn.execute("DELETE FROM catalog_events")
+            events, new_offset = read_catalog_events_from_offset(changes_path, 0)
+        insert_catalog_event_rows(conn, events)
+        write_sync_state_values(
+            conn,
+            {
+                "catalog_changes_mtime_ns": changes_mtime,
+                "catalog_changes_size": changes_size,
+                "catalog_changes_offset": new_offset,
+            },
         )
 
 
@@ -5189,10 +5336,7 @@ def rebuild_read_model_db(
             inserted = insert_attempt_rows(conn, rows)
             refresh_catalog_tables(conn, catalog_path)
             refresh_identity_tables(conn, registry_path)
-            conn.execute(
-                "INSERT OR REPLACE INTO sync_state(key, value) VALUES ('log_offset', ?)",
-                (str(offset),),
-            )
+            write_sync_state_values(conn, {"log_offset": offset})
             conn.commit()
         except Exception:
             conn.rollback()
@@ -5219,8 +5363,7 @@ def sync_read_model_db(
         conn.execute("BEGIN IMMEDIATE")
         try:
             create_read_model_schema(conn)
-            row = conn.execute("SELECT value FROM sync_state WHERE key = 'log_offset'").fetchone()
-            offset = int(row["value"]) if row is not None and str(row["value"]).isdigit() else 0
+            offset = read_sync_state_int(conn, "log_offset", 0)
             if log_size < offset:
                 conn.rollback()
                 return rebuild_read_model_db(
@@ -5233,10 +5376,7 @@ def sync_read_model_db(
             inserted = insert_attempt_rows(conn, rows)
             refresh_catalog_tables(conn, catalog_path)
             refresh_identity_tables(conn, registry_path)
-            conn.execute(
-                "INSERT OR REPLACE INTO sync_state(key, value) VALUES ('log_offset', ?)",
-                (str(new_offset),),
-            )
+            write_sync_state_values(conn, {"log_offset": new_offset})
             conn.commit()
         except Exception:
             conn.rollback()
@@ -5245,7 +5385,6 @@ def sync_read_model_db(
 
 
 def load_identity_registry_from_db(conn: Any) -> ModelIdentityRegistry:
-    create_read_model_schema(conn)
     identities: dict[tuple[str, str], ModelIdentity] = {}
     defaults: dict[str, str] = {}
     engine_meta: dict[str, ModelIdentity] = {}
@@ -5282,8 +5421,7 @@ def db_attempt_rows(
     since: str | None = None,
     engine: str | None = None,
 ) -> tuple[list[dict[str, Any]], ModelIdentityRegistry]:
-    with contextlib.closing(connect_read_model_db(db_path)) as conn:
-        create_read_model_schema(conn)
+    with contextlib.closing(connect_read_model_db_readonly(db_path)) as conn:
         query = """
             SELECT run_id, task_key, logged_at, engine, model, task_type, retry,
                    verdict, duration_ms, worker_tokens, orchestrator
@@ -5311,7 +5449,6 @@ def db_attempt_rows(
             for row in conn.execute(query, params)
         ]
         registry = load_identity_registry_from_db(conn)
-        conn.commit()
     if since is not None:
         selected_row_ids: set[int] = set()
         for task_rows in group_model_log_tasks(rows):
@@ -5330,8 +5467,7 @@ def db_attempt_rows(
 
 
 def db_catalog_models(db_path: Path) -> list[dict[str, Any]]:
-    with contextlib.closing(connect_read_model_db(db_path)) as conn:
-        create_read_model_schema(conn)
+    with contextlib.closing(connect_read_model_db_readonly(db_path)) as conn:
         rows = [
             {
                 "id": row["id"],
@@ -5347,18 +5483,15 @@ def db_catalog_models(db_path: Path) -> list[dict[str, Any]]:
             }
             for row in conn.execute("SELECT * FROM catalog_models ORDER BY id")
         ]
-        conn.commit()
         return rows
 
 
 def db_catalog_events(db_path: Path, *, limit: int = 20) -> list[dict[str, Any]]:
-    with contextlib.closing(connect_read_model_db(db_path)) as conn:
-        create_read_model_schema(conn)
+    with contextlib.closing(connect_read_model_db_readonly(db_path)) as conn:
         rows = conn.execute(
             "SELECT payload FROM catalog_events ORDER BY id DESC LIMIT ?",
             (limit,),
         ).fetchall()
-        conn.commit()
     events: list[dict[str, Any]] = []
     for row in rows:
         try:
@@ -6288,7 +6421,7 @@ def render_model_scoreboard_html(
 ) -> str:
     catalog_by_id = catalog_models_by_id(catalog_models)
     ordered = order_model_scoreboard_rows(rows, catalog_by_id)
-    generated = generated_at or datetime.now(timezone.utc).replace(microsecond=0).isoformat()
+    generated = generated_at or datetime.now().astimezone().replace(microsecond=0).isoformat()
     table_rows = "".join(
         render_model_table_pair(
             row,
